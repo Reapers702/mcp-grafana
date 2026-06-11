@@ -57,9 +57,35 @@ type UpdateDashboardParams struct {
 	UserID    int64  `json:"userId,omitempty" jsonschema:"description=ID of the user making the change"`
 }
 
+// isDashboardAllowed checks if the given dashboard UID is in the allowed whitelist.
+// Returns false if the whitelist is empty (deny all) or if the UID is not in the list.
+func isDashboardAllowed(ctx context.Context, uid string) bool {
+	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
+	if len(cfg.AllowedDashboards) == 0 {
+		return false
+	}
+	for _, allowed := range cfg.AllowedDashboards {
+		if allowed == uid {
+			return true
+		}
+	}
+	return false
+}
+
 // updateDashboard intelligently handles dashboard updates using either full JSON or patch operations.
 // It automatically uses the most efficient approach based on the provided parameters.
 func updateDashboard(ctx context.Context, args UpdateDashboardParams) (*models.PostDashboardOKBody, error) {
+	// Check dashboard UID whitelist before any write operation
+	targetUID := args.UID
+	if targetUID == "" && args.Dashboard != nil {
+		if uid, ok := args.Dashboard["uid"].(string); ok {
+			targetUID = uid
+		}
+	}
+	if targetUID != "" && !isDashboardAllowed(ctx, targetUID) {
+		return nil, fmt.Errorf("dashboard UID %q is not in the allowed dashboards whitelist (GRAFANA_ALLOWED_DASHBOARDS). Write operations are restricted to approved dashboards only. If GRAFANA_ALLOWED_DASHBOARDS is not set, all write operations are denied", targetUID)
+	}
+
 	// Determine the update strategy based on provided parameters
 	if len(args.Operations) > 0 && args.UID != "" {
 		// Patch-based update: fetch current dashboard and apply operations

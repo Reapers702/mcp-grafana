@@ -43,6 +43,8 @@ const (
 
 	grafanaUsernameEnvVar = "GRAFANA_USERNAME"
 	grafanaPasswordEnvVar = "GRAFANA_PASSWORD"
+	grafanaSessionEnvVar        = "GRAFANA_SESSION"         // grafana_session cookie for 2FA environments
+	grafanaAllowedDashboardsEnvVar = "GRAFANA_ALLOWED_DASHBOARDS" // comma-separated list of allowed dashboard UIDs for write operations
 
 	grafanaExtraHeadersEnvVar   = "GRAFANA_EXTRA_HEADERS"
 	grafanaForwardHeadersEnvVar = "GRAFANA_FORWARD_HEADERS"
@@ -266,6 +268,15 @@ type GrafanaConfig struct {
 	// ExtraHeaders contains additional HTTP headers to send with all Grafana API requests.
 	// Parsed from GRAFANA_EXTRA_HEADERS environment variable as JSON object.
 	ExtraHeaders map[string]string
+
+	// SessionCookie is the grafana_session cookie value for cookie-based authentication.
+	// Used in environments with 2FA where API key/service account token auth is not available.
+	SessionCookie string
+
+	// AllowedDashboards is a whitelist of dashboard UIDs that are allowed for write operations.
+	// When set, only dashboards with UIDs in this list can be created/updated via update_dashboard.
+	// Parsed from GRAFANA_ALLOWED_DASHBOARDS environment variable (comma-separated).
+	AllowedDashboards []string
 
 	// MaxLokiLogLimit is the maximum number of log lines that can be returned
 	// from Loki queries.
@@ -506,19 +517,20 @@ func NewExtraHeadersRoundTripper(rt http.RoundTripper, headers map[string]string
 
 // AuthRoundTripper wraps an http.RoundTripper to add authentication headers.
 // It supports on-behalf-of (OBO) auth via access/ID tokens, API key bearer
-// auth, and HTTP basic auth, in that priority order.
+// auth, HTTP basic auth, and session cookie auth, in that priority order.
 type AuthRoundTripper struct {
 	accessToken string
 	idToken     string
 	apiKey      string
 	basicAuth   *url.Userinfo
+	cookie      string
 	underlying  http.RoundTripper
 }
 
 func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	clonedReq := req.Clone(req.Context())
 
-	accessToken, idToken, apiKey, basicAuth := rt.accessToken, rt.idToken, rt.apiKey, rt.basicAuth
+	accessToken, idToken, apiKey, basicAuth, cookie := rt.accessToken, rt.idToken, rt.apiKey, rt.basicAuth, rt.cookie
 	cfg := GrafanaConfigFromContext(req.Context())
 	if cfg.AccessToken != "" {
 		accessToken = cfg.AccessToken
@@ -532,12 +544,17 @@ func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	if cfg.BasicAuth != nil {
 		basicAuth = cfg.BasicAuth
 	}
+	if cfg.SessionCookie != "" {
+		cookie = cfg.SessionCookie
+	}
 
 	if accessToken != "" && idToken != "" {
 		clonedReq.Header.Set("X-Access-Token", accessToken)
 		clonedReq.Header.Set("X-Grafana-Id", idToken)
 	} else if apiKey != "" {
 		clonedReq.Header.Set("Authorization", "Bearer "+apiKey)
+	} else if cookie != "" {
+		clonedReq.Header.Set("Cookie", "grafana_session="+cookie)
 	} else if basicAuth != nil {
 		password, _ := basicAuth.Password()
 		clonedReq.SetBasicAuth(basicAuth.Username(), password)
@@ -546,7 +563,7 @@ func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	return rt.underlying.RoundTrip(clonedReq)
 }
 
-func NewAuthRoundTripper(rt http.RoundTripper, accessToken, idToken, apiKey string, basicAuth *url.Userinfo) *AuthRoundTripper {
+func NewAuthRoundTripper(rt http.RoundTripper, accessToken, idToken, apiKey string, basicAuth *url.Userinfo, cookie string) *AuthRoundTripper {
 	if rt == nil {
 		rt = http.DefaultTransport
 	}
@@ -555,6 +572,7 @@ func NewAuthRoundTripper(rt http.RoundTripper, accessToken, idToken, apiKey stri
 		idToken:     idToken,
 		apiKey:      apiKey,
 		basicAuth:   basicAuth,
+		cookie:      cookie,
 		underlying:  rt,
 	}
 }
@@ -690,7 +708,7 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 
 	// Auth (innermost header layer — wins on conflicts with ExtraHeaders)
 	if !options.withoutAuth {
-		transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
+		transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth, cfg.SessionCookie)
 	}
 
 	// Extra headers (always included so per-request context overrides work)
@@ -773,12 +791,26 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 
 	extraHeaders := extraHeadersFromEnv(logger)
 
-	logger.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "org_id", orgID, "extra_headers_count", len(extraHeaders))
+	sessionCookie := os.Getenv(grafanaSessionEnvVar)
+
+	var allowedDashboards []string
+	if v := os.Getenv(grafanaAllowedDashboardsEnvVar); v != "" {
+		for _, uid := range strings.Split(v, ",") {
+			uid = strings.TrimSpace(uid)
+			if uid != "" {
+				allowedDashboards = append(allowedDashboards, uid)
+			}
+		}
+	}
+
+	logger.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "session_cookie_set", sessionCookie != "", "org_id", orgID, "extra_headers_count", len(extraHeaders), "allowed_dashboards_count", len(allowedDashboards))
 	config.URL = u
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
+	config.SessionCookie = sessionCookie
 	config.OrgID = orgID
 	config.ExtraHeaders = extraHeaders
+	config.AllowedDashboards = allowedDashboards
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -1058,17 +1090,18 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 						}
 					}
 					// Use BuildTransport but skip APIKey/BasicAuth auth
-					// (handled by the OpenAPI client). OBO tokens still need
-					// transport-level injection since the OpenAPI client
-					// doesn't support them natively.
+					// (handled by the OpenAPI client). OBO tokens and session
+					// cookies still need transport-level injection since the
+					// OpenAPI client doesn't support them natively.
 					oboConfig := GrafanaConfig{
-						AccessToken:  config.AccessToken,
-						IDToken:      config.IDToken,
-						OrgID:        config.OrgID,
-						TLSConfig:    config.TLSConfig,
-						ExtraHeaders: config.ExtraHeaders,
-						Debug:        config.Debug,
-						Logger:       config.Logger,
+						AccessToken:    config.AccessToken,
+						IDToken:        config.IDToken,
+						SessionCookie:  config.SessionCookie,
+						OrgID:          config.OrgID,
+						TLSConfig:      config.TLSConfig,
+						ExtraHeaders:   config.ExtraHeaders,
+						Debug:          config.Debug,
+						Logger:         config.Logger,
 					}
 					// Panic matches the existing TLS error handling above
 					// (line ~887). The only realistic failure is a TLS
