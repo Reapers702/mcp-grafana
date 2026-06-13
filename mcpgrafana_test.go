@@ -277,6 +277,18 @@ func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
 		config := GrafanaConfigFromContext(ctx)
 		assert.Equal(t, int64(0), config.OrgID)
 	})
+
+	t.Run("extracts session cookie and allowed dashboards from env", func(t *testing.T) {
+		t.Setenv("GRAFANA_SESSION", "test-session-cookie")
+		t.Setenv("GRAFANA_ALLOWED_DASHBOARDS", "uid1, uid2 ,uid3")
+
+		req, err := http.NewRequest("GET", "http://example.com", nil)
+		require.NoError(t, err)
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		config := GrafanaConfigFromContext(ctx)
+		assert.Equal(t, "test-session-cookie", config.SessionCookie)
+		assert.Equal(t, []string{"uid1", "uid2", "uid3"}, config.AllowedDashboards)
+	})
 }
 
 func TestExtractGrafanaClientPath(t *testing.T) {
@@ -880,7 +892,7 @@ func TestAuthRoundTripper(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "access-tok", "id-tok", "api-key", nil)
+		rt := NewAuthRoundTripper(mock, "access-tok", "id-tok", "api-key", nil, "")
 		req, _ := http.NewRequest("GET", "http://example.com", nil)
 		_, err := rt.RoundTrip(req)
 		require.NoError(t, err)
@@ -897,7 +909,7 @@ func TestAuthRoundTripper(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "my-api-key", nil)
+		rt := NewAuthRoundTripper(mock, "", "", "my-api-key", nil, "")
 		req, _ := http.NewRequest("GET", "http://example.com", nil)
 		_, err := rt.RoundTrip(req)
 		require.NoError(t, err)
@@ -913,7 +925,7 @@ func TestAuthRoundTripper(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "", url.UserPassword("user", "pass"))
+		rt := NewAuthRoundTripper(mock, "", "", "", url.UserPassword("user", "pass"), "")
 		req, _ := http.NewRequest("GET", "http://example.com", nil)
 		_, err := rt.RoundTrip(req)
 		require.NoError(t, err)
@@ -929,12 +941,31 @@ func TestAuthRoundTripper(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "my-key", nil)
+		rt := NewAuthRoundTripper(mock, "", "", "my-key", nil, "")
 		req, _ := http.NewRequest("GET", "http://example.com", nil)
 		_, err := rt.RoundTrip(req)
 		require.NoError(t, err)
 
 		assert.Empty(t, req.Header.Get("Authorization"))
+	})
+
+	t.Run("sets session cookie and basic auth concurrently", func(t *testing.T) {
+		var capturedReq *http.Request
+		mock := &capturingMockRT{fn: func(req *http.Request) (*http.Response, error) {
+			capturedReq = req
+			return &http.Response{StatusCode: 200}, nil
+		}}
+
+		rt := NewAuthRoundTripper(mock, "", "", "", url.UserPassword("user", "pass"), "my-session-cookie")
+		req, _ := http.NewRequest("GET", "http://example.com", nil)
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		user, pass, ok := capturedReq.BasicAuth()
+		require.True(t, ok)
+		assert.Equal(t, "user", user)
+		assert.Equal(t, "pass", pass)
+		assert.Equal(t, "grafana_session=my-session-cookie", capturedReq.Header.Get("Cookie"))
 	})
 }
 
@@ -1833,7 +1864,7 @@ func TestAuthRoundTripperContextOverride(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "captured-key", nil)
+		rt := NewAuthRoundTripper(mock, "", "", "captured-key", nil, "")
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{
 			AccessToken: "ctx-access",
 			IDToken:     "ctx-id",
@@ -1854,7 +1885,7 @@ func TestAuthRoundTripperContextOverride(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "captured-key", nil)
+		rt := NewAuthRoundTripper(mock, "", "", "captured-key", nil, "")
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{APIKey: "ctx-key"})
 		req, _ := http.NewRequestWithContext(ctx, "GET", "http://example.com", nil)
 		_, err := rt.RoundTrip(req)
@@ -1870,7 +1901,7 @@ func TestAuthRoundTripperContextOverride(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "", url.UserPassword("old-user", "old-pass"))
+		rt := NewAuthRoundTripper(mock, "", "", "", url.UserPassword("old-user", "old-pass"), "")
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{
 			BasicAuth: url.UserPassword("new-user", "new-pass"),
 		})
@@ -1891,7 +1922,7 @@ func TestAuthRoundTripperContextOverride(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "captured-key", nil)
+		rt := NewAuthRoundTripper(mock, "", "", "captured-key", nil, "")
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{})
 		req, _ := http.NewRequestWithContext(ctx, "GET", "http://example.com", nil)
 		_, err := rt.RoundTrip(req)
@@ -1907,7 +1938,7 @@ func TestAuthRoundTripperContextOverride(t *testing.T) {
 			return &http.Response{StatusCode: 200}, nil
 		}}
 
-		rt := NewAuthRoundTripper(mock, "", "", "", nil)
+		rt := NewAuthRoundTripper(mock, "", "", "", nil, "")
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{
 			AccessToken: "ctx-access",
 			IDToken:     "ctx-id",

@@ -75,6 +75,17 @@ func isDashboardAllowed(ctx context.Context, uid string) bool {
 // updateDashboard intelligently handles dashboard updates using either full JSON or patch operations.
 // It automatically uses the most efficient approach based on the provided parameters.
 func updateDashboard(ctx context.Context, args UpdateDashboardParams) (*models.PostDashboardOKBody, error) {
+	// Validate parameters first to return specific validation error messages
+	if args.UID != "" && len(args.Operations) == 0 {
+		return nil, fmt.Errorf("'uid' was provided without 'operations'. To update an existing dashboard, provide both 'uid' and 'operations' (array of patch operations). To replace a dashboard entirely, provide 'dashboard' (full JSON) instead")
+	}
+	if len(args.Operations) > 0 && args.UID == "" {
+		return nil, fmt.Errorf("'operations' were provided without 'uid'. To apply patch operations, provide the 'uid' of the existing dashboard to update along with the 'operations' array")
+	}
+	if args.Dashboard == nil && args.UID == "" && len(args.Operations) == 0 {
+		return nil, fmt.Errorf("no dashboard content provided (either 'dashboard' for full update or 'uid' and 'operations' for patches must be provided). Do NOT retry unless request parameters are corrected")
+	}
+
 	// Check dashboard UID whitelist before any write operation
 	targetUID := args.UID
 	if targetUID == "" && args.Dashboard != nil {
@@ -93,13 +104,9 @@ func updateDashboard(ctx context.Context, args UpdateDashboardParams) (*models.P
 	} else if args.Dashboard != nil {
 		// Full dashboard update: use the provided JSON
 		return updateDashboardWithFullJSON(ctx, args)
-	} else if args.UID != "" && len(args.Operations) == 0 {
-		return nil, fmt.Errorf("'uid' was provided without 'operations'. To update an existing dashboard, provide both 'uid' and 'operations' (array of patch operations). To replace a dashboard entirely, provide 'dashboard' (full JSON) instead")
-	} else if len(args.Operations) > 0 && args.UID == "" {
-		return nil, fmt.Errorf("'operations' were provided without 'uid'. To apply patch operations, provide the 'uid' of the existing dashboard to update along with the 'operations' array")
-	} else {
-		return nil, fmt.Errorf("no dashboard content provided. You must use one of two modes: (1) Patch mode (preferred for existing dashboards): provide 'uid' + 'operations' array with targeted changes. (2) Full JSON mode: provide 'dashboard' with the complete dashboard object. Do NOT retry this same call — choose a mode and provide the required fields")
 	}
+
+	return nil, fmt.Errorf("unexpected dashboard update parameters")
 }
 
 // updateDashboardWithPatches applies patch operations to an existing dashboard

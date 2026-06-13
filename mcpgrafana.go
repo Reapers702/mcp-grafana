@@ -1,6 +1,7 @@
 package mcpgrafana
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -553,11 +554,13 @@ func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		clonedReq.Header.Set("X-Grafana-Id", idToken)
 	} else if apiKey != "" {
 		clonedReq.Header.Set("Authorization", "Bearer "+apiKey)
-	} else if cookie != "" {
-		clonedReq.Header.Set("Cookie", "grafana_session="+cookie)
 	} else if basicAuth != nil {
 		password, _ := basicAuth.Password()
 		clonedReq.SetBasicAuth(basicAuth.Username(), password)
+	}
+
+	if cookie != "" {
+		clonedReq.Header.Set("Cookie", "grafana_session="+cookie)
 	}
 
 	return rt.underlying.RoundTrip(clonedReq)
@@ -605,15 +608,34 @@ type debugLoggingRoundTripper struct {
 }
 
 func (rt *debugLoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	redacted := req.Clone(req.Context())
-	redacted.Body = nil
-	for name := range sensitiveHeaders {
-		if v := redacted.Header.Get(name); v != "" {
-			redacted.Header.Set(name, redactHeaderValue(v))
+	unredacted := os.Getenv("GRAFANA_LOG_UNREDACTED") == "true"
+
+	var bodyBytes []byte
+	if req.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		if err == nil {
+			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
 	}
-	if dump, err := httputil.DumpRequestOut(redacted, false); err == nil {
-		rt.logger.Debug(string(dump))
+
+	redacted := req.Clone(req.Context())
+	if len(bodyBytes) > 0 {
+		redacted.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+
+	if !unredacted {
+		for name := range sensitiveHeaders {
+			if v := redacted.Header.Get(name); v != "" {
+				redacted.Header.Set(name, redactHeaderValue(v))
+			}
+		}
+	}
+
+	if dump, err := httputil.DumpRequestOut(redacted, len(bodyBytes) > 0); err == nil {
+		rt.logger.Info("MCP -> Grafana Server Request:\n" + string(dump))
+	} else {
+		rt.logger.Warn("Failed to dump request", "error", err)
 	}
 
 	resp, err := rt.underlying.RoundTrip(req)
@@ -621,8 +643,23 @@ func (rt *debugLoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response
 		return resp, err
 	}
 
-	if dump, dumpErr := httputil.DumpResponse(resp, false); dumpErr == nil {
-		rt.logger.Debug(string(dump))
+	var respBodyBytes []byte
+	if resp.Body != nil {
+		var readErr error
+		respBodyBytes, readErr = io.ReadAll(resp.Body)
+		if readErr == nil {
+			resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
+		}
+	}
+
+	respClone := *resp
+	if len(respBodyBytes) > 0 {
+		respClone.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
+	}
+	if dump, dumpErr := httputil.DumpResponse(&respClone, len(respBodyBytes) > 0); dumpErr == nil {
+		rt.logger.Info("Grafana Server -> MCP Response:\n" + string(dump))
+	} else {
+		rt.logger.Warn("Failed to dump response", "error", dumpErr)
 	}
 	return resp, nil
 }
@@ -830,9 +867,23 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 
 	u, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req, logger)
 
+	sessionCookie := os.Getenv(grafanaSessionEnvVar)
+
+	var allowedDashboards []string
+	if v := os.Getenv(grafanaAllowedDashboardsEnvVar); v != "" {
+		for _, uid := range strings.Split(v, ",") {
+			uid = strings.TrimSpace(uid)
+			if uid != "" {
+				allowedDashboards = append(allowedDashboards, uid)
+			}
+		}
+	}
+
 	config.URL = u
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
+	config.SessionCookie = sessionCookie
+	config.AllowedDashboards = allowedDashboards
 	config.OrgID = orgID
 	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
 	return WithGrafanaConfig(ctx, config)
@@ -1120,14 +1171,15 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 
 	// Fetch the public URL from Grafana's frontend settings.
 	fetchCfg := &GrafanaConfig{
-		URL:          grafanaURL,
-		APIKey:       apiKey,
-		BasicAuth:    auth,
-		AccessToken:  config.AccessToken,
-		IDToken:      config.IDToken,
-		TLSConfig:    config.TLSConfig,
-		ExtraHeaders: config.ExtraHeaders,
-		Logger:       config.Logger,
+		URL:           grafanaURL,
+		APIKey:        apiKey,
+		BasicAuth:     auth,
+		SessionCookie: config.SessionCookie,
+		AccessToken:   config.AccessToken,
+		IDToken:       config.IDToken,
+		TLSConfig:     config.TLSConfig,
+		ExtraHeaders:  config.ExtraHeaders,
+		Logger:        config.Logger,
 	}
 	publicURL := fetchPublicURL(ctx, fetchCfg)
 
