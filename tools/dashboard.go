@@ -52,6 +52,7 @@ type UpdateDashboardParams struct {
 
 	// Common parameters
 	FolderUID string `json:"folderUid,omitempty" jsonschema:"description=The UID of the dashboard's folder"`
+	FolderID  int64  `json:"folderId,omitempty" jsonschema:"description=The numeric ID of the dashboard's folder"`
 	Message   string `json:"message,omitempty" jsonschema:"description=Set a commit message for the version history"`
 	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"description=Overwrite the dashboard if it exists. Otherwise create one"`
 	UserID    int64  `json:"userId,omitempty" jsonschema:"description=ID of the user making the change"`
@@ -103,6 +104,14 @@ func updateDashboard(ctx context.Context, args UpdateDashboardParams) (*models.P
 		return updateDashboardWithPatches(ctx, args)
 	} else if args.Dashboard != nil {
 		// Full dashboard update: use the provided JSON
+		if args.FolderUID == "" && args.FolderID == 0 {
+			if uid, ok := args.Dashboard["uid"].(string); ok && uid != "" {
+				if existing, err := getDashboardByUID(ctx, GetDashboardByUIDParams{UID: uid}); err == nil && existing.Meta != nil {
+					args.FolderUID = existing.Meta.FolderUID
+					args.FolderID = existing.Meta.FolderID
+				}
+			}
+		}
 		return updateDashboardWithFullJSON(ctx, args)
 	}
 
@@ -165,11 +174,16 @@ func updateDashboardWithPatches(ctx context.Context, args UpdateDashboardParams)
 	if folderUID == "" && dashboard.Meta != nil {
 		folderUID = dashboard.Meta.FolderUID
 	}
+	folderID := args.FolderID
+	if folderID == 0 && dashboard.Meta != nil {
+		folderID = dashboard.Meta.FolderID
+	}
 
 	// Update with the patched dashboard
 	return updateDashboardWithFullJSON(ctx, UpdateDashboardParams{
 		Dashboard: dashboardMap,
 		FolderUID: folderUID,
+		FolderID:  folderID,
 		Message:   args.Message,
 		Overwrite: true,
 		UserID:    args.UserID,
@@ -182,6 +196,7 @@ func updateDashboardWithFullJSON(ctx context.Context, args UpdateDashboardParams
 	cmd := &models.SaveDashboardCommand{
 		Dashboard: args.Dashboard,
 		FolderUID: args.FolderUID,
+		FolderID:  args.FolderID,
 		Message:   args.Message,
 		Overwrite: args.Overwrite,
 		UserID:    args.UserID,
