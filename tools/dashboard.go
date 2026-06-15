@@ -95,7 +95,14 @@ func updateDashboard(ctx context.Context, args UpdateDashboardParams) (*models.P
 		}
 	}
 	if targetUID != "" && !isDashboardAllowed(ctx, targetUID) {
-		return nil, fmt.Errorf("dashboard UID %q is not in the allowed dashboards whitelist (GRAFANA_ALLOWED_DASHBOARDS). Write operations are restricted to approved dashboards only. If GRAFANA_ALLOWED_DASHBOARDS is not set, all write operations are denied", targetUID)
+		cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
+		var allowedList string
+		if len(cfg.AllowedDashboards) == 0 {
+			allowedList = "none (empty whitelist denies all write operations)"
+		} else {
+			allowedList = strings.Join(cfg.AllowedDashboards, ", ")
+		}
+		return nil, fmt.Errorf("dashboard UID %q is not in the allowed dashboards whitelist (GRAFANA_ALLOWED_DASHBOARDS). Currently allowed dashboards are: [%s]. Write operations are restricted to approved dashboards only", targetUID, allowedList)
 	}
 
 	// Determine the update strategy based on provided parameters
