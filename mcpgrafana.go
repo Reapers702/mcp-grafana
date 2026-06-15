@@ -525,13 +525,18 @@ type AuthRoundTripper struct {
 	apiKey      string
 	basicAuth   *url.Userinfo
 	cookie      string
+	mu          sync.RWMutex
 	underlying  http.RoundTripper
 }
 
 func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	clonedReq := req.Clone(req.Context())
 
-	accessToken, idToken, apiKey, basicAuth, cookie := rt.accessToken, rt.idToken, rt.apiKey, rt.basicAuth, rt.cookie
+	accessToken, idToken, apiKey, basicAuth := rt.accessToken, rt.idToken, rt.apiKey, rt.basicAuth
+	rt.mu.RLock()
+	cookie := rt.cookie
+	rt.mu.RUnlock()
+
 	cfg := GrafanaConfigFromContext(req.Context())
 	if cfg.AccessToken != "" {
 		accessToken = cfg.AccessToken
@@ -563,20 +568,97 @@ func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		clonedReq.Header.Set("Cookie", "grafana_session="+cookie)
 	}
 
-	return rt.underlying.RoundTrip(clonedReq)
+	resp, err := rt.underlying.RoundTrip(clonedReq)
+	if err == nil && resp != nil {
+		// Extract any Set-Cookie headers to automatically refresh the session cookie
+		for _, c := range resp.Cookies() {
+			if c.Name == "grafana_session" && c.Value != "" {
+				rt.mu.Lock()
+				if rt.cookie != c.Value {
+					slog.Info("Detected new grafana_session in Set-Cookie response. Updating in-memory session.",
+						"old", redactHeaderValue(rt.cookie),
+						"new", redactHeaderValue(c.Value))
+					rt.cookie = c.Value
+				}
+				rt.mu.Unlock()
+				break
+			}
+		}
+	}
+	return resp, err
 }
 
 func NewAuthRoundTripper(rt http.RoundTripper, accessToken, idToken, apiKey string, basicAuth *url.Userinfo, cookie string) *AuthRoundTripper {
 	if rt == nil {
 		rt = http.DefaultTransport
 	}
-	return &AuthRoundTripper{
+	art := &AuthRoundTripper{
 		accessToken: accessToken,
 		idToken:     idToken,
 		apiKey:      apiKey,
 		basicAuth:   basicAuth,
 		cookie:      cookie,
 		underlying:  rt,
+	}
+
+	// If session cookie is configured and no other tokens exist, start keep-alive loop
+	if cookie != "" && apiKey == "" && accessToken == "" {
+		go art.startKeepAlive()
+	}
+
+	return art
+}
+
+func getGrafanaURLForKeepAlive() string {
+	if u := os.Getenv("GRAFANA_URL"); u != "" {
+		return u
+	}
+	return "http://localhost:3000"
+}
+
+func (rt *AuthRoundTripper) startKeepAlive() {
+	grafanaURL := getGrafanaURLForKeepAlive()
+	healthURL := strings.TrimRight(grafanaURL, "/") + "/api/health"
+
+	slog.Info("Starting in-memory session keep-alive loop", "url", healthURL)
+
+	client := &http.Client{
+		Transport: rt,
+		Timeout:   10 * time.Second,
+	}
+
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		rt.mu.RLock()
+		currentCookie := rt.cookie
+		rt.mu.RUnlock()
+
+		if currentCookie == "" {
+			slog.Debug("Session keep-alive skipped: cookie is empty")
+			continue
+		}
+
+		req, err := http.NewRequest("GET", healthURL, nil)
+		if err != nil {
+			slog.Error("Failed to create keep-alive request", "error", err)
+			continue
+		}
+
+		slog.Debug("Sending session keep-alive request to Grafana", "url", healthURL)
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Warn("Session keep-alive request failed", "error", err)
+			continue
+		}
+
+		if resp.Body != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		slog.Debug("Session keep-alive request completed", "status", resp.Status)
 	}
 }
 
